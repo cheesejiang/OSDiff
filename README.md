@@ -9,9 +9,11 @@ todo
 ---
 
 ## 📦 Requirements
-todo
-
-
+```bash
+conda create -n osdiff python=3.8
+conda activate osdiff
+pip install -r requirements.txt
+```
 ---
 
 ## ⚙️ Inference
@@ -23,9 +25,12 @@ Download the pre-trained checkpoint from [pretrain_weight](https://drive.google.
 ---
 
 ### Run the Test Script
-
-todo
-
+```bash
+python inference.py \
+    --ckpt_lc ./weight/lambda_1.ckpt \
+    --input path to input images \
+    --output path to output files
+```
 ---
 
 
