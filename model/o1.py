@@ -1,0 +1,1184 @@
+import time
+import torch
+import torch as th
+import torch.nn as nn
+import lpips
+from typing import Dict, Mapping, Any
+import os
+import math
+import pyiqa
+import einops
+import numpy as np
+from pytorch_lightning.utilities.types import EPOCH_OUTPUT #################问题
+from utils.utils import *
+import lpips
+from torch.utils.checkpoint import checkpoint as check
+
+from ldm.modules.diffusionmodules.util import (
+    conv_nd,
+    linear,
+    zero_module,
+    timestep_embedding,
+    checkpoint
+)
+import bitsandbytes as bnb
+from .spaced_sampler import SpacedSampler
+from einops import rearrange
+from ldm.modules.attention import BasicTransformerBlock, SpatialTransformer
+from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.modules.diffusionmodules.openaimodel import (
+    UNetModel,
+    UNetModel_Bottleneck,
+    TimestepEmbedSequential,
+    ResBlock as ResBlock_orig,
+    Downsample,
+    Upsample,
+    AttentionBlock,
+    TimestepBlock
+)
+from ldm.util import log_txt_as_img, exists, instantiate_from_config, default
+from torch.utils.tensorboard import SummaryWriter
+# from tensorboardX import SummaryWriter
+class GuidanceModel(nn.Module):
+    def __init__(
+            self,
+    ):
+        super().__init__()
+
+        self.Discriminator = UNetModel_Bottleneck(
+            image_size=32, in_channels=4, model_channels=320,
+            out_channels=4, num_res_blocks=2,
+            attention_resolutions=[ 4, 2, 1 ], dropout=0, channel_mult=[ 1, 2, 4, 4 ],
+            conv_resample=True, dims=2, use_checkpoint=True,
+            use_fp16=False, num_heads=-1, num_head_channels=64, ###
+            num_heads_upsample=-1, use_scale_shift_norm=False,
+            resblock_updown=False, use_new_attention_order=False,
+            use_spatial_transformer=True, transformer_depth=1,
+            context_dim=1024, n_embed=None, legacy=False, 
+            use_linear_in_transformer=True,
+        )  # initialise control model from base model
+        self.Discriminator.requires_grad_(True)
+        self.DMLP = nn.Sequential(
+                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=2, padding=1), # 8x8 -> 4x4 
+                    nn.GroupNorm(num_groups=32, num_channels=1280),
+                    nn.SiLU(),
+                    nn.Conv2d(kernel_size=4, in_channels=1280, out_channels=1280, stride=4, padding=0), # 4x4 -> 1x1
+                    nn.GroupNorm(num_groups=32, num_channels=1280),
+                    nn.SiLU(),
+                    nn.Conv2d(kernel_size=1, in_channels=1280, out_channels=1, stride=1, padding=0), # 1x1 -> 1x1
+                )
+        self.DMLP.requires_grad_(True)
+    def forward(self, x_noisy, t, crossattn):
+        # 将xt图像送入得到中间层特征图
+        #print("x_noisy.shape", x_noisy.shape)
+        # x_noisy.shape torch.Size([4, 4, 64, 64])
+        # eps.shape torch.Size([4, 1280, 8, 8])
+        eps = self.Discriminator( # Unet
+            x=x_noisy, timesteps=t, context=crossattn).float()
+        #print("eps.shape", eps.shape)
+        logits = self.DMLP(eps).squeeze(dim=[2, 3])
+        return logits
+    
+
+class CDDM(nn.Module):
+    def __init__(
+            self,
+            image_size,
+            in_channels,
+            model_channels,
+            out_channels,
+            hint_channels,
+            num_res_blocks,
+            attention_resolutions,
+            dropout=0,
+            channel_mult=(1, 2, 4, 8),
+            conv_resample=True,
+            dims=2,
+            use_checkpoint=False,
+            use_fp16=False,
+            num_heads=-1,
+            num_head_channels=-1,
+            num_heads_upsample=-1,
+            use_scale_shift_norm=False,
+            resblock_updown=False,
+            use_new_attention_order=False,
+            use_spatial_transformer=False,  # custom transformer support
+            transformer_depth=1,  # custom transformer support
+            context_dim=None,  # custom transformer support
+            n_embed=None,  # custom support for prediction of discrete ids into codebook of first stage vq model
+            legacy=False,
+            use_linear_in_transformer=False,
+            control_model_ratio=1.0,        # ratio of the control model size compared to the base model. [0, 1]
+            learn_embedding=True,
+            control_scale=1.0
+    ):
+        super().__init__()
+
+        self.learn_embedding = learn_embedding
+        self.control_model_ratio = control_model_ratio
+        self.out_channels = out_channels
+        self.dims = 2
+        self.model_channels = model_channels
+        self.control_scale = control_scale
+
+        ################# start control model variations #################
+        base_model = UNetModel(
+            image_size=image_size, in_channels=in_channels, model_channels=model_channels,
+            out_channels=out_channels, num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions, dropout=dropout, channel_mult=channel_mult,
+            conv_resample=conv_resample, dims=dims, use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16, num_heads=num_heads, num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample, use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown, use_new_attention_order=use_new_attention_order,
+            use_spatial_transformer=use_spatial_transformer, transformer_depth=transformer_depth,
+            context_dim=context_dim, n_embed=n_embed, legacy=legacy,
+            use_linear_in_transformer=use_linear_in_transformer,
+        )  # initialise control model from base model
+        
+        self.control_model = ControlModule(
+            image_size=image_size, in_channels=in_channels, model_channels=model_channels, hint_channels=hint_channels,
+            out_channels=out_channels, num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions, dropout=dropout, channel_mult=channel_mult,
+            conv_resample=conv_resample, dims=dims, use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16, num_heads=num_heads, num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample, use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown, use_new_attention_order=use_new_attention_order,
+            use_spatial_transformer=use_spatial_transformer, transformer_depth=transformer_depth,
+            context_dim=context_dim, n_embed=n_embed, legacy=legacy,
+            use_linear_in_transformer=use_linear_in_transformer,
+            control_model_ratio=control_model_ratio,
+        )  # initialise pretrained model
+
+        ################# end control model variations #################
+
+        self.enc_zero_convs_out = nn.ModuleList([])
+
+        self.middle_block_out = None
+        self.middle_block_in = None
+
+        self.dec_zero_convs_out = nn.ModuleList([])
+
+        ch_inout_ctr = {'enc': [], 'mid': [], 'dec': []}
+        ch_inout_base = {'enc': [], 'mid': [], 'dec': []}
+
+        ################# Gather Channel Sizes #################
+        for module in self.control_model.input_blocks:
+            # 在ch_inout_ctr['enc']中统计通道大小
+            if isinstance(module[0], nn.Conv2d):
+                ch_inout_ctr['enc'].append((module[0].in_channels, module[0].out_channels))
+            elif isinstance(module[0], (ResBlock, ResBlock_orig)):
+                ch_inout_ctr['enc'].append((module[0].channels, module[0].out_channels))
+            elif isinstance(module[0], Downsample):
+                ch_inout_ctr['enc'].append((module[0].channels, module[-1].out_channels))
+
+        for module in base_model.input_blocks:
+            # 在ch_inout_base['enc']中统计通道大小
+            if isinstance(module[0], nn.Conv2d):
+                ch_inout_base['enc'].append((module[0].in_channels, module[0].out_channels))
+            elif isinstance(module[0], (ResBlock, ResBlock_orig)):
+                ch_inout_base['enc'].append((module[0].channels, module[0].out_channels))
+            elif isinstance(module[0], Downsample):
+                ch_inout_base['enc'].append((module[0].channels, module[-1].out_channels))
+
+        ch_inout_ctr['mid'].append((self.control_model.middle_block[0].channels, self.control_model.middle_block[-1].out_channels))
+        ch_inout_base['mid'].append((base_model.middle_block[0].channels, base_model.middle_block[-1].out_channels))
+
+        # for module in self.control_model.output_blocks:
+        #     if isinstance(module[0], nn.Conv2d):
+        #         ch_inout_ctr['dec'].append((module[0].in_channels, module[0].out_channels))
+        #     elif isinstance(module[0], (ResBlock, ResBlock_orig)):
+        #         ch_inout_ctr['dec'].append((module[0].channels, module[0].out_channels))
+        #     elif isinstance(module[-1], Upsample):
+        #         ch_inout_ctr['dec'].append((module[0].channels, module[-1].out_channels))
+
+        for module in base_model.output_blocks:
+            if isinstance(module[0], nn.Conv2d):
+                ch_inout_base['dec'].append((module[0].in_channels, module[0].out_channels))
+            elif isinstance(module[0], (ResBlock, ResBlock_orig)):
+                ch_inout_base['dec'].append((module[0].channels, module[0].out_channels))
+            elif isinstance(module[-1], Upsample):
+                ch_inout_base['dec'].append((module[0].channels, module[-1].out_channels))
+
+        self.ch_inout_ctr = ch_inout_ctr
+        self.ch_inout_base = ch_inout_base
+
+        ################# Build zero convolutions #################
+        self.middle_block_out = self.make_zero_conv(ch_inout_ctr['mid'][-1][1], ch_inout_base['mid'][-1][1])
+
+        self.dec_zero_convs_out.append(
+            self.make_zero_conv(ch_inout_ctr['enc'][-1][1], ch_inout_base['mid'][-1][1])
+        )
+        for i in range(1, len(ch_inout_ctr['enc'])):
+            self.dec_zero_convs_out.append(
+                self.make_zero_conv(ch_inout_ctr['enc'][-(i + 1)][1], ch_inout_base['dec'][i - 1][1])
+            )
+        for i in range(len(ch_inout_ctr['enc'])):
+            self.enc_zero_convs_out.append(self.make_zero_conv(
+                in_channels=ch_inout_ctr['enc'][i][1], out_channels=ch_inout_base['enc'][i][1])
+                    )
+
+        # 缩放因子用于调整从控制模型到基础模型的特征图叠加时的比例
+        # 为每个编码器中的零卷积层分配一个缩放因子，值为 1.0，生成长度为 len(self.enc_zero_convs_out) 的数组。
+        # [1.] 中间部分为单个缩放因子 1.0，通常用于中间瓶颈层（middle_block）。
+        # [1.] * len(self.dec_zero_convs_out)：为每个解码器中的零卷积层分配一个缩放因子 1.0，生成长度为 len(self.dec_zero_convs_out) 的数组。
+        scale_list = [1.] * len(self.enc_zero_convs_out) + [1.] + [1.] * len(self.dec_zero_convs_out)
+        self.register_buffer('scale_list', torch.tensor(scale_list) * self.control_scale)
+    
+    # 函数的作用是将输入的特征通道数 in_channels 通过 1x1 卷积映射到输出通道数 out_channels
+    def make_zero_conv(self, in_channels, out_channels=None):
+        self.in_channels = in_channels
+        self.out_channels = out_channels or in_channels
+        return TimestepEmbedSequential( # 通过 conv_nd 创建一个 1x1 卷积层，并通过 zero_module 将其初始化为输出零的卷积模块。
+            zero_module(conv_nd(self.dims, in_channels, out_channels, 1, padding=0))
+        )
+
+    def forward(self, x, hint, timesteps, context, base_model, **kwargs):
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.control_model.time_embed(t_emb) # 线性层
+        emb_base = base_model.time_embed(t_emb) # 线性层
+
+        # 将输入 x 转换为基础模型的数据类型
+        h_base = x.type(base_model.dtype) # h_base即zt
+        # 将输入 x 与控制特征 hint 在通道维度上拼接
+        h_ctr = torch.cat((h_base, hint), dim=1)
+        
+        hs_base = []
+        hs_ctr = []
+        it_enc_convs_out = iter(self.enc_zero_convs_out)
+        it_dec_convs_out = iter(self.dec_zero_convs_out)
+        scales = iter(self.scale_list)
+
+        ###################### Cross Control  ######################
+        i = 0
+        # input blocks (encoder) 11层
+        for module_base, module_ctr in zip(base_model.input_blocks, self.control_model.input_blocks):
+            h_base = module_base(h_base, emb_base, context)
+            h_ctr = module_ctr(h_ctr, emb, context)
+            # 控制模型的特征图 h_ctr 通过 it_enc_convs_out进行卷积处理后，加入到基础模型的 h_base 上，并乘以缩放因子 scales
+            # print("h_base",h_base.shape,i)
+            h_base = h_base + next(it_enc_convs_out)(h_ctr, emb) * next(scales)
+            # print("h_base2",h_base.shape,i)
+
+            hs_base.append(h_base)
+            hs_ctr.append(h_ctr)
+            i = i+1
+
+        # mid blocks (bottleneck)
+        h_base = base_model.middle_block(h_base, emb_base, context)
+        h_ctr = self.control_model.middle_block(h_ctr, emb, context)
+
+        h_base = h_base + self.middle_block_out(h_ctr, emb) * next(scales)
+
+        # output blocks (decoder)
+        for module_base in base_model.output_blocks:
+            h_base = h_base + next(it_dec_convs_out)(hs_ctr.pop(), emb) * next(scales)
+
+            h_base = th.cat([h_base, hs_base.pop()], dim=1)
+            h_base = module_base(h_base, emb_base, context)
+
+        return base_model.out(h_base)
+    
+class ControlModule(nn.Module):
+    def __init__(
+        self,
+        image_size,
+        in_channels,
+        model_channels,
+        hint_channels,
+        out_channels,
+        num_res_blocks, # 2 
+        attention_resolutions,
+        dropout=0,
+        channel_mult=(1, 2, 4, 8), # 1,2,4,4
+        conv_resample=True,
+        dims=2,
+        num_classes=None,
+        use_checkpoint=False,
+        use_fp16=False,
+        num_heads=-1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=False,
+        resblock_updown=False,
+        use_new_attention_order=False,
+        use_spatial_transformer=False,    # custom transformer support
+        transformer_depth=1,              # custom transformer support
+        context_dim=None,                 # custom transformer support
+        n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
+        legacy=True,
+        disable_self_attentions=None,
+        num_attention_blocks=None,
+        disable_middle_self_attn=False,
+        use_linear_in_transformer=False,
+        control_model_ratio=1.0,
+    ):
+        super().__init__()
+        if use_spatial_transformer:
+            assert context_dim is not None, 'Fool!! You forgot to include the dimension of your cross-attention conditioning...'
+
+        if context_dim is not None:
+            assert use_spatial_transformer, 'Fool!! You forgot to use the spatial transformer for your cross-attention conditioning...'
+            from omegaconf.listconfig import ListConfig
+            if type(context_dim) == ListConfig:
+                context_dim = list(context_dim)
+
+
+        if num_heads_upsample == -1:
+            num_heads_upsample = num_heads
+
+        if num_heads == -1:
+            assert num_head_channels != -1, 'Either num_heads or num_head_channels has to be set'
+
+        if num_head_channels == -1:
+            assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
+
+        self.image_size = image_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        if isinstance(num_res_blocks, int):
+            self.num_res_blocks = len(channel_mult) * [num_res_blocks] # [2,2,2,2]
+        else:
+            if len(num_res_blocks) != len(channel_mult):
+                raise ValueError("provide num_res_blocks either as an int (globally constant) or "
+                                 "as a list/tuple (per-level) with the same length as channel_mult")
+            self.num_res_blocks = num_res_blocks
+        if disable_self_attentions is not None:
+            # should be a list of booleans, indicating whether to disable self-attention in TransformerBlocks or not
+            assert len(disable_self_attentions) == len(channel_mult)
+        if num_attention_blocks is not None:
+            assert len(num_attention_blocks) == len(self.num_res_blocks)
+            assert all(map(lambda i: self.num_res_blocks[i] >= num_attention_blocks[i], range(len(num_attention_blocks))))
+            print(f"Constructor of UNetModel received num_attention_blocks={num_attention_blocks}. "
+                  f"This option has LESS priority than attention_resolutions {attention_resolutions}, "
+                  f"i.e., in cases where num_attention_blocks[i] > 0 but 2**i not in attention_resolutions, "
+                  f"attention will still not be set.")
+
+        self.attention_resolutions = attention_resolutions # [4,2,1]
+        self.dropout = dropout
+        self.channel_mult = channel_mult
+        self.conv_resample = conv_resample
+        self.num_classes = num_classes
+        self.use_checkpoint = use_checkpoint
+        self.dtype = th.float16 if use_fp16 else th.float32
+        self.num_heads = num_heads
+        self.num_head_channels = num_head_channels
+        self.num_heads_upsample = num_heads_upsample
+        self.predict_codebook_ids = n_embed is not None
+
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            linear(time_embed_dim, time_embed_dim),
+        )
+
+        model_channels = int(model_channels * control_model_ratio)
+        self.model_channels = model_channels
+        self.control_model_ratio = control_model_ratio
+
+        if self.num_classes is not None:
+            if isinstance(self.num_classes, int):
+                self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            elif self.num_classes == "continuous":
+                print("setting up linear c_adm embedding layer")
+                self.label_emb = nn.Linear(1, time_embed_dim)
+            else:
+                raise ValueError()
+
+        self.input_blocks = nn.ModuleList(
+            [
+                TimestepEmbedSequential( # 这个模块是一个包含时间步嵌入的顺序模型。它继承自 nn.Sequential，用于将多个层按顺序进行前向传播。
+                    # 在这里，它包含一个 3x3 的卷积层，输入数据不仅包括 in_channels，还有控制特征图（hint_channels）。
+                    conv_nd(dims, in_channels+hint_channels, model_channels, 3, padding=1)
+                )
+            ]
+        )
+        self._feature_size = model_channels
+        input_block_chans = [model_channels]
+        ch = model_channels
+        ds = 1
+        for level, mult in enumerate(channel_mult):
+            for nr in range(self.num_res_blocks[level]):
+                layers = [
+                    ResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=mult * model_channels,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                ]
+                ch = mult * model_channels
+                if ds in attention_resolutions:
+                    if num_head_channels == -1:
+                        dim_head = ch // num_heads
+                    else:
+                        num_head_channels = find_denominator(ch, self.num_head_channels)
+                        num_heads = ch // num_head_channels
+                        dim_head = num_head_channels
+                    if legacy:
+                        dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+                    if exists(disable_self_attentions):
+                        disabled_sa = disable_self_attentions[level]
+                    else:
+                        disabled_sa = False
+
+                    if not exists(num_attention_blocks) or nr < num_attention_blocks[level]:
+                        layers.append(
+                            AttentionBlock(
+                                ch,
+                                use_checkpoint=use_checkpoint,
+                                num_heads=num_heads,
+                                num_head_channels=dim_head,
+                                use_new_attention_order=use_new_attention_order,
+                            ) if not use_spatial_transformer else SpatialTransformer(
+                                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                disable_self_attn=disabled_sa, use_linear=use_linear_in_transformer,
+                                use_checkpoint=use_checkpoint
+                            )
+                        )
+                        
+                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(channel_mult) - 1:
+                out_ch = ch
+                self.input_blocks.append(
+                    TimestepEmbedSequential(
+                        ResBlock(
+                            ch,
+                            time_embed_dim,
+                            dropout,
+                            out_channels=out_ch,
+                            dims=dims,
+                            use_checkpoint=use_checkpoint,
+                            use_scale_shift_norm=use_scale_shift_norm,
+                            down=True,
+                        )
+                        if resblock_updown
+                        else Downsample(
+                            ch,
+                            conv_resample, dims=dims, out_channels=out_ch
+                        )
+                    )
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                ds *= 2
+                self._feature_size += ch
+
+        if num_head_channels == -1:
+            dim_head = ch // num_heads
+        else:
+            num_heads = ch // num_head_channels
+            dim_head = num_head_channels
+        if legacy:
+            dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+        self.middle_block = TimestepEmbedSequential(
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                out_channels=ch,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+            AttentionBlock(
+                ch,
+                use_checkpoint=use_checkpoint,
+                num_heads=num_heads,
+                num_head_channels=dim_head,
+                use_new_attention_order=use_new_attention_order,
+            ) if not use_spatial_transformer else SpatialTransformer(  # always uses a self-attn
+                ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                disable_self_attn=disable_middle_self_attn, use_linear=use_linear_in_transformer,
+                use_checkpoint=use_checkpoint
+            ),
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_checkpoint=use_checkpoint,
+                use_scale_shift_norm=use_scale_shift_norm,
+            ),
+        )
+        self._feature_size += ch
+
+def find_denominator(number, start):
+    if start >= number:
+        return number
+    while (start != 0):
+        residual = number % start
+        if residual == 0:
+            return start
+        start -= 1
+
+def normalization(channels):
+    """
+    Make a standard normalization layer.
+    :param channels: number of input channels.
+    :return: an nn.Module for normalization.
+    """
+    # if find_denominator(channels, 32) < 32:
+    #     print(f'[USING GROUPNORM OVER LESS CHANNELS ({find_denominator(channels, 32)}) FOR {channels} CHANNELS]')
+    return GroupNorm_leq32(find_denominator(channels, 32), channels)
+
+class GroupNorm_leq32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+    
+class ResBlock(TimestepBlock):
+    """
+    A residual block that can optionally change the number of channels.
+    :param channels: the number of input channels.
+    :param emb_channels: the number of timestep embedding channels.
+    :param dropout: the rate of dropout.
+    :param out_channels: if specified, the number of out channels.
+    :param use_conv: if True and out_channels is specified, use a spatial
+        convolution instead of a smaller 1x1 convolution to change the
+        channels in the skip connection.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param use_checkpoint: if True, use gradient checkpointing on this module.
+    :param up: if True, use this block for upsampling.
+    :param down: if True, use this block for downsampling.
+    """
+
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        dims=2,
+        use_checkpoint=False,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims)
+            self.x_upd = Upsample(channels, False, dims)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims)
+            self.x_upd = Downsample(channels, False, dims)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        """
+        Apply the block to a Tensor, conditioned on a timestep embedding.
+        :param x: an [N x C x ...] Tensor of features.
+        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
+        :return: an [N x C x ...] Tensor of outputs.
+        """
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
+
+    def _forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
+    
+class OSDiff(LatentDiffusion):
+
+    def __init__(
+        self, 
+        control_stage_config: Mapping[str, Any], 
+        control_key: str,
+        sd_locked: bool,
+        # synch_control: bool,
+        learning_rate: float,
+        aux_learning_rate: float,
+        g_learning_rate: float,
+        l_bpp_weight: float,
+        l_guide_weight: float,
+        l_lpips_weights: float,
+        l_d_weights: float,
+        sync_path: str, 
+        synch_control: bool,
+        ckpt_path_pre: str,
+        preprocess_config: Mapping[str, Any],# 这是一个映射（或类似于字典的）结构，保存用于预处理数据的各种配置参数。键是字符串，值可以是任何数据类型，包括字符串、整数、列表等。它用于指定如何处理原始数据，使其能够作为模型的输入。
+        calculate_metrics: Mapping[str, Any],
+        *args, 
+        **kwargs
+    ) -> "OSDiff":
+        super().__init__(*args, **kwargs)
+        self.writer = SummaryWriter(log_dir="tb_logs/diff")
+        self.control_model = instantiate_from_config(control_stage_config)
+        self.preprocess_model = instantiate_from_config(preprocess_config)
+        self.guidance_model = GuidanceModel()
+        if sync_path is not None:
+            self.sync_control_weights_from_base_checkpoint(sync_path, synch_control=synch_control)
+        if ckpt_path_pre is not None:
+            self.load_preprocess_ckpt(ckpt_path_pre=ckpt_path_pre)
+        if sync_path is not None: ##########1加载判别器初始权重
+            self.load_Discriminator_ckpt(sync_path)
+        self.control_key = control_key
+        self.sd_locked = sd_locked
+        
+        self.learning_rate = learning_rate
+        self.aux_learning_rate = aux_learning_rate
+        self.g_learning_rate = g_learning_rate
+        self.l_bpp_weight = l_bpp_weight
+        self.l_guide_weight = l_guide_weight
+        self.l_lpips_weights = l_lpips_weights
+        self.l_d_weights = l_d_weights 
+        # self.loss_fn_vgg = lpips.LPIPS(net="alex").cuda()
+        # self.loss_fn_vgg.requires_grad_(False)
+
+        self.calculate_metrics = calculate_metrics
+        # 构建损失函数
+        self.metric_funcs = {}
+        for _, opt in calculate_metrics.items(): 
+            mopt = opt.copy()
+            name = mopt.pop('type', None)
+            mopt.pop('better', None)
+            self.metric_funcs[name] = pyiqa.create_metric(name, device=self.device, **mopt)
+        
+        
+        
+        self.automatic_optimization = False # 关闭自动优化
+    
+    def apply_condition_encoder(self, control, x):
+        c_latent, likelihoods, q_likelihoods = self.preprocess_model(control, x)
+        return c_latent, likelihoods, q_likelihoods
+    
+    @torch.no_grad()
+    def apply_condition_compress(self, control, stream_path, H, W):
+        ref = self.encode_first_stage(control * 2 - 1).mode() * self.scale_factor ##zg
+        # print("zg", ref.shape)
+        out = self.preprocess_model.compress(ref, None) ## 直接把zg输入到编码器
+        shape = out["shape"]
+        with Path(stream_path).open("wb") as f:
+            write_body(f, shape, out["strings"])
+        size = filesize(stream_path)
+        bpp = float(size) * 8 / (H * W)
+        return bpp, ref
+
+    @torch.no_grad()
+    def apply_condition_decompress(self, stream_path):
+        with Path(stream_path).open("rb") as f:
+            strings, shape = read_body(f)
+        c_latent = self.preprocess_model.decompress(strings, shape)
+        return c_latent
+    
+    def get_input(self, batch, k, generator_turn, guidance_turn, bs=None, *args, **kwargs):
+        image, x, c = super().get_input(batch, self.first_stage_key, bs=bs, *args, **kwargs) 
+        control = batch[self.control_key]
+        if bs is not None:
+            control = control[:bs]
+        control = control.to(self.device)
+        control = einops.rearrange(control, 'b h w c -> b c h w')
+        control = control.to(memory_format=torch.contiguous_format).float()
+        if guidance_turn: #
+            with torch.no_grad():
+                c_latent, likelihoods, q_likelihoods = self.apply_condition_encoder(x, None)
+        else:
+            c_latent, likelihoods, q_likelihoods = self.apply_condition_encoder(x, None)
+        # x本来作为zg特征来引导，现在作为输入，一个是维度的问题，一个是control到底是什么？
+        # c_latent, likelihoods, q_likelihoods = self.apply_condition_encoder(control, x) # preprocess_model
+        N , _, H, W = control.shape
+        num_pixels = N * H * W
+        bpp = sum((torch.log(likelihood).sum() / (-math.log(2) * num_pixels)) for likelihood in likelihoods)
+        q_bpp = sum((torch.log(likelihood).sum() / (-math.log(2) * num_pixels)) for likelihood in q_likelihoods)
+        return image, x, dict(c_crossattn=[c], c_latent=[c_latent], bpp=bpp, q_bpp=q_bpp, control=[control])
+    
+    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        assert isinstance(cond, dict) # 预测噪声
+        diffusion_model = self.model.diffusion_model # unet_config
+
+        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        # print("cond_txt.shape", cond_txt.shape)
+        cond_hint = torch.cat(cond['c_latent'], 1)
+        # print("latent", cond['c_latent'][0].shape)
+        # print("latent", cond['c_latent'])
+        # print("cond_hint", cond_hint.shape)# 4,4,64,64 #1,4,96,96
+        #print("cond_hint", cond_hint)
+
+        eps = self.control_model( # CDDM
+            x=x_noisy, timesteps=t, context=cond_txt, hint=cond_hint, base_model=diffusion_model)
+        
+        return eps
+    
+    @torch.no_grad()
+    def get_unconditional_conditioning(self, N):
+        return self.get_learned_conditioning([""] * N)
+    
+    @torch.no_grad()
+    def log_images(self, batch, sample_steps=1, bs=2):
+        log = dict()
+        _, z, c = self.get_input(batch, self.first_stage_key,generator_turn=False,guidance_turn=False, bs=bs)
+        bpp = c["q_bpp"]
+        bpp_img = [f'{bpp:2f}']*4
+        c_latent = c["c_latent"][0]
+        control = c["control"][0]
+        c = c["c_crossattn"][0]
+
+        log["hq"] = (self.decode_first_stage(z) + 1) / 2
+        log["control"] = control
+        log["text"] = (log_txt_as_img((512, 512), bpp_img, size=16) + 1) / 2
+        
+        samples = self.sample_log(
+            cond={"c_crossattn": [c], "c_latent": [c_latent]},
+            steps=sample_steps
+        )
+        x_samples = self.decode_first_stage(samples)
+        log["samples"] = (x_samples + 1) / 2
+
+        return log, bpp
+    
+    @torch.no_grad()
+    def sample_log(self, cond, steps):
+        sampler = SpacedSampler(self)
+        b, c, h, w = cond["c_latent"][0].shape # cond={"c_crossattn": [c], "c_latent": [c_latent]},
+        shape = (b, self.channels, h, w)
+        
+        # XT = cond["c_latent"] + torch.randn(shape, device=cond.device)
+        samples = sampler.sample(
+            steps, shape, cond, unconditional_guidance_scale=1.0, 
+            unconditional_conditioning=None
+        )
+        return samples
+    
+    
+    def sample_log_train(self, cond, steps, x_T):
+        sampler = SpacedSampler(self)
+        b, c, h, w = cond["c_latent"][0].shape # cond={"c_crossattn": [c], "c_latent": [c_latent]},
+        shape = (b, self.channels, h, w)
+        
+        # XT = cond["c_latent"] + torch.randn(shape, device=cond.device)
+        samples = sampler.sample(
+            steps, shape, cond, x_T=x_T, unconditional_guidance_scale=1.0, 
+            unconditional_conditioning=None
+        )
+        return samples
+    
+    
+    def configure_optimizers(self): ##########2加入guidance_model的参数
+        # 处理非quantiles参数
+        lr = self.learning_rate
+        params = list(self.control_model.parameters()) # 这部分control_model里的参数有哪些呢？
+        params += list(param for name, param in self.preprocess_model.named_parameters() 
+                       if not name.endswith('.quantiles'))
+        if not self.sd_locked: ########sd_locked
+            params_d = list(self.model.diffusion_model.parameters()) # ##减小学习率
+            # params += list(self.model.diffusion_model.output_blocks.parameters())
+            # params += list(self.model.diffusion_model.out.parameters())
+        # opt = torch.optim.AdamW([
+        #     {'params': params, 'lr': lr},
+        #     # {'params': params_d, 'lr': lr * 0.5}
+        # ])
+        opt = bnb.optim.AdamW8bit([
+            {'params': params, 'lr': lr},
+            # {'params': params_d, 'lr': lr * 0.5}
+        ])
+
+
+        # 处理quantiles参数
+        aux_lr = self.aux_learning_rate
+        aux_params = list(param for name, param in self.preprocess_model.named_parameters() 
+                       if name.endswith('.quantiles'))
+        aux_opt =  torch.optim.AdamW(aux_params, lr=aux_lr) 
+        
+
+        # 处理guidance_model的参数
+        g_lr = self.g_learning_rate
+        g_params = list(self.guidance_model.parameters())
+        g_opt = bnb.optim.AdamW8bit(g_params, lr = g_lr)
+        return opt, aux_opt, g_opt
+    from torch.utils.checkpoint import checkpoint
+
+
+    
+
+    def p_losses(self, image,x_start, cond, t, generator_turn=False, guidance_turn=False, noise=None): # 把None放后面
+        loss_dict = {}
+        # print("generator_turn", generator_turn)
+        # print("guidance_turn", guidance_turn)
+        prefix = 'T' if self.training else 'V' # 训练和验证模式
+            
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        # 如果 noise 参数未提供，则自动生成与 x_start 形状一致的随机噪声
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        # x_noisy为zc+噪声
+        model_output = self.apply_model(x_noisy, t, cond)
+        z0_stu = self.predict_start_from_noise(x_noisy, t, model_output)
+        #  使用 q_sample 函数给输入添加噪声，模拟扩散过程的前向步骤
+        # c = cond["c_crossattn"][0]
+        # c_latent = cond['c_latent'][0][:,:4,:,:]
+        # z0_stu = self.sample_log_train( # 这里还是需要计算梯度的
+        #                 cond={"c_crossattn": [c], "c_latent": [c_latent]},
+        #                 steps=1, x_T=x_noisy) # 一步扩散模型生成的干净潜在变量
+
+        if generator_turn:  
+            # print("generator_turn!!!!!!!!!!!!!!!!!!!!")  
+            # model_output = self.apply_model(x_noisy, t, cond)
+            # # 将噪声数据与条件信息通过模型获取预测结果 control_model(unet_model)，这里是噪声
+
+            # if self.parameterization == "x0":
+            #     target = x_start
+            # elif self.parameterization == "eps":
+            #     target = noise ###
+            # elif self.parameterization == "v":
+            #     target = self.get_v(x_start, noise, t)
+            # else:
+            #     raise NotImplementedError()
+
+            # # 损失1 eps 扩散损失应该是
+            # loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+            # loss_dict.update({f'{prefix}/l_simple': loss_simple.mean()})
+
+            # logvar_t = self.logvar[t].to(self.device)
+            # # 获取当前时间步 t 的对数方差，用于对损失加权
+            # loss = loss_simple / torch.exp(logvar_t) + logvar_t
+            # if self.learn_logvar:
+            #     loss_dict.update({f'{prefix}/l_gamma': loss.mean()})
+            #     loss_dict.update({'logvar': self.logvar.data.mean()})
+
+            # loss = self.l_simple_weight * loss.mean()
+            # 损失1
+            loss_simple = self.get_loss(z0_stu, x_start).mean()
+            loss_dict.update({f'{prefix}/l_simple': loss_simple})
+            loss = self.l_simple_weight * loss_simple
+            # 损失2 bpp
+            loss_bpp = cond['bpp']
+            guide_bpp = cond['q_bpp']
+            loss_dict.update({f'{prefix}/l_bpp': loss_bpp.mean()})
+            loss_dict.update({f'{prefix}/q_bpp': guide_bpp.mean()})
+            loss += self.l_bpp_weight * loss_bpp
+
+            # 损失3 引导损失
+            c_latent = cond['c_latent'][0][:,:4,:,:]
+            loss_guide = self.get_loss(c_latent, x_start) # pred, target
+            # zc和zg的差别
+            loss_dict.update({f'{prefix}/l_guide': loss_guide.mean()})
+            loss += self.l_guide_weight * loss_guide
+            
+            # 损失4 GAN生成损失
+            c = cond["c_crossattn"][0]
+            # z0_stu = self.sample_log_train( # 这里还是需要计算梯度的
+            #             cond={"c_crossattn": [c], "c_latent": [c_latent]},
+            #             steps=1) # 一步扩散模型生成的干净潜在变量
+            # 对生成结果加噪
+            noise1 = torch.randn_like(z0_stu)
+            t1 = torch.randint(0, 1000, (z0_stu.shape[0],), device=self.device).long()
+            # 如果 noise 参数未提供，则自动生成与 x_start 形状一致的随机噪声
+            zt_stu = self.q_sample(x_start=z0_stu, t=t1, noise=noise1)
+            # 送入判别器
+            with torch.no_grad(): # 不要更新判别器部分了
+                z_stu_logits = self.guidance_model(zt_stu, t1, c)
+            
+            Generator_loss = F.softplus(-z_stu_logits).mean()
+            loss += Generator_loss * 1e-2 # 3e-3
+            loss_dict.update({f'{prefix}/l_generator': Generator_loss.mean()})
+            # # 损失5 LPIPS
+            # # 只对前 N 张图像计算 LPIPS
+            # N = 1  # 例如原 batch size = 4，你只用前N张
+            # # pred_image = self.decode_first_stage(z0_stu[:N])
+            # with torch.cuda.amp.autocast():
+            #     pred_image = self.decode_first_stage(z0_stu[:N])
+            #     lpips_loss = self.loss_fn_vgg(image[:N], pred_image).mean()
+                
+            # loss += lpips_loss * 1e-1
+            # loss_dict.update({f'{prefix}/l_lpips': lpips_loss})
+
+        
+            
+
+            
+            
+            
+        if guidance_turn: # 判别器损失
+            # print("guidance_turn!!!!!!!!!!!!!!!!!!!!") 
+            # with torch.no_grad(): # 不要更新生成器部分
+            #     c_latent = cond['c_latent'][0][:,:4,:,:]
+            c = cond["c_crossattn"][0]
+            #     z0_stu = self.sample_log(
+            #         cond={"c_crossattn": [c], "c_latent": [c_latent]},
+            #         steps=1) # 一步扩散模型生成的干净潜在变量
+            # 对生成结果加噪
+            z0_stu_d = z0_stu.detach()
+            noise1 = torch.randn_like(z0_stu_d)
+            t1 = torch.randint(0, 1000, (z0_stu_d.shape[0],), device=self.device).long()
+            # 如果 noise 参数未提供，则自动生成与 x_start 形状一致的随机噪声
+            zt_stu = self.q_sample(x_start=z0_stu_d, t=t1, noise=noise1)
+            z_g = x_start.detach()
+            zt_g = self.q_sample(x_start=z_g, t=t1, noise=noise1)
+            # 送入判别器
+            z_stu_logits = self.guidance_model(zt_stu, t1, c)
+            z_c_logits = self.guidance_model(zt_g, t1, c)
+            Discriminator_loss = F.softplus(z_stu_logits).mean() + F.softplus(-z_c_logits).mean()
+            loss = Discriminator_loss #* 1e-2
+            loss_dict.update({f'{prefix}/l_discriminator': Discriminator_loss})
+
+
+            # 将噪声数据与条件信息通过模型获取预测结果 control_model(unet_model)，这里是噪声
+            # # 损失4 失真损失
+            # control = cond["control"][0] # 原图
+            # c = cond["c_crossattn"][0]
+            # samples = self.sample_log(
+            #     cond={"c_crossattn": [c], "c_latent": [c_latent]},
+            #     steps=1)
+            # x_samples = self.decode_first_stage(samples) # 调用callback后这里就cuda out of memory
+            # loss_d = self.get_loss(control, x_samples)
+            # loss_lpips = self.net_lpips(x_samples, control) * self.l_lpips_weights
+            
+            # loss_d = loss_lpips.mean()  + loss_d
+            # loss_dict.update({f'{prefix}/l_d': loss_d.mean()})
+            # loss += self.l_d_weights * loss_d
+            
+
+        loss_dict.update({f'{prefix}/loss': loss})
+
+        return loss, loss_dict
+    
+    def training_step(self, batch, batch_idx):
+        (opt_g, opt_aux, opt_d) = self.optimizers()
+            # 这段代码的核心逻辑是根据指定的概率 p，随机选择是否将当前批次中的某些数据替换为预设的值 val。
+            # 这种机制在训练中通常用于无条件指导（Unconditional Guidance），
+            # 可以帮助模型学习在某些情况下忽略某些输入数据或引入噪声，从而提升模型的泛化能力
+        
+        for k in self.ucg_training:
+            p = self.ucg_training[k]["p"] # 获取概率p
+            val = self.ucg_training[k]["val"] # 获取要替换的值
+            if val is None:
+                val = ""
+            for i in range(len(batch[k])):
+                if self.ucg_prng.choice(2, p=[1 - p, p]): # 随机选择 0 或 1，概率分别为 1 - p 和 p 为0,则不替换，为1则替换为val
+                    batch[k][i] = val
+        self.guidance_model.requires_grad_(False)
+        # 计算损失
+        loss, loss_dict = self.shared_step(batch,generator_turn=True, guidance_turn=False) # get_input p_losses
+        # self.writer.add_scalar("Loss/train_loss", loss_dict.item(), self.global_step)
+        self.guidance_model.requires_grad_(True)
+        # 计算梯度
+        loss.backward()
+        self.clip_gradients(
+                opt_g,
+                gradient_clip_val=1.0,
+                gradient_clip_algorithm="norm",
+            )
+        opt_g.step()
+        opt_g.zero_grad()
+        opt_aux.zero_grad()
+        opt_d.zero_grad()
+
+
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor):  # 如果是张量类型，提取标量
+                self.writer.add_scalar(f"Loss_G/{key}", value.item(), self.global_step)
+            else:  # 否则直接记录
+                self.writer.add_scalar(f"Loss_G/{key}", value, self.global_step)
+
+
+        self.log_dict(loss_dict, prog_bar=True,
+                    logger=True, on_step=True, on_epoch=True)
+
+        self.log("global_step", self.global_step,
+                prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+     
+        
+    
+        aux_loss = self.preprocess_model.aux_loss()
+        aux_loss.backward()
+        # self.clip_gradients(
+        #         opt_aux,
+        #         gradient_clip_val=1.0,
+        #         gradient_clip_algorithm="norm",
+        #     )
+        opt_aux.step()
+        opt_aux.zero_grad()
+        opt_g.zero_grad()
+        opt_d.zero_grad()
+        self.log("aux_loss", aux_loss,
+                prog_bar=True, logger=True, on_step=True, on_epoch=False)
+        
+    
+        
+        loss, loss_dict = self.shared_step(batch,generator_turn=False, guidance_turn=True) # get_input p_losses
+        loss.backward()
+        # for name, param in self.control_model.named_parameters():
+        #     if param.grad is not None:
+        #         print(f"{name} grad norm: {param.grad.norm().item()}")
+        #     else:
+        #         print(f"{name} has no gradient")
+        self.clip_gradients(
+                opt_d,
+                gradient_clip_val=1.0,
+                gradient_clip_algorithm="norm",
+            )
+        opt_d.step()
+        opt_d.zero_grad()
+        opt_g.zero_grad()
+        opt_aux.zero_grad()
+        
+
+        
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor):  # 如果是张量类型，提取标量
+                self.writer.add_scalar(f"Loss_D/{key}", value.item(), self.global_step)
+            else:  # 否则直接记录
+                self.writer.add_scalar(f"Loss_D/{key}", value, self.global_step)
+        #self.preprocess_model.requires_grad_(True)
+        #self.control_model.requires_grad_(True)
+
+        self.log_dict(loss_dict, prog_bar=True,
+                    logger=True, on_step=True, on_epoch=True)
+
+        self.log("global_step", self.global_step,
+                prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+                                      
+ 
+        
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        out = []
+        log, bpp = self.log_images(batch, bs=None)
+        out.append(bpp.cpu())
+        # save images
+        save_dir = os.path.join(self.logger.save_dir, "validation", f'{self.global_step}')
+        os.makedirs(save_dir, exist_ok=True)
+        image = log["samples"].detach().cpu()
+        image = image.numpy().squeeze().transpose(1,2,0)
+        image = (image * 255).clip(0, 255).astype(np.uint8)
+        path = os.path.join(save_dir, f'{batch_idx}.png')
+        Image.fromarray(image).save(path)
+
+        control = log["control"].detach().cpu()
+        control = control.numpy().squeeze().transpose(1,2,0)
+        control = (control * 255).clip(0, 255).astype(np.uint8)
+
+        metric_data = [img2tensor(image).unsqueeze(0) / 255.0, img2tensor(control).unsqueeze(0) / 255.0]
+
+        for name, _ in self.calculate_metrics.items():
+            out.append(self.metric_funcs[name](*metric_data))
+
+        
+        return out
+    
+    def on_train_end(self): # 在训练完全结束后调用
+        self.writer.close()
+
+    def validation_epoch_end(self, outputs: EPOCH_OUTPUT): #   
+        outputs = np.array(outputs)
+        avg_out = sum(outputs)/len(outputs)
+        self.log("avg_bpp", avg_out[0],
+                    prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        
+        for i, (name, _) in enumerate(self.calculate_metrics.items()):
+            self.log(f"avg_{name}", avg_out[i+1],
+                    prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        
+    def load_preprocess_ckpt(self, ckpt_path_pre):
+        ckpt = torch.load(ckpt_path_pre)
+        self.preprocess_model.load_state_dict(ckpt)
+        print(['CONTROL WEIGHTS LOADED'])
+    
+    def load_Discriminator_ckpt(self, ckpt_path_pre):
+        ckpt = torch.load(ckpt_path_pre)
+        state_dict = ckpt.get("state_dict", ckpt)
+        state_dict_new = {}
+        for key, value in list(state_dict.items()):
+            if "model.diffusion_model." in key:
+                state_dict_new[key[len("model.diffusion_model."):]] = value
+        self.guidance_model.Discriminator.load_state_dict(state_dict_new, strict=False)
+        print(['Discriminator WEIGHTS LOADED'])
+
+
+    def sync_control_weights_from_base_checkpoint(self, path, synch_control=True):
+        ckpt_base = torch.load(path)  # load the base model checkpoints
+
+        if synch_control:
+            # add copy for control_module weights from the base model
+            for key in list(ckpt_base['state_dict'].keys()):
+                if "diffusion_model." in key:
+                    if 'control_model.control' + key[15:] in self.state_dict().keys():
+                        if ckpt_base['state_dict'][key].shape != self.state_dict()['control_model.control' + key[15:]].shape:
+                            if len(ckpt_base['state_dict'][key].shape) == 1:
+                                dim = 0
+                                control_dim = self.state_dict()['control_model.control' + key[15:]].size(dim)
+                                ckpt_base['state_dict']['control_model.control' + key[15:]] = torch.cat([
+                                    ckpt_base['state_dict'][key],
+                                    ckpt_base['state_dict'][key]
+                                ], dim=dim)[:control_dim]
+                            else:
+                                dim = 0
+                                control_dim_0 = self.state_dict()['control_model.control' + key[15:]].size(dim)
+                                dim = 1
+                                control_dim_1 = self.state_dict()['control_model.control' + key[15:]].size(dim)
+                                ckpt_base['state_dict']['control_model.control' + key[15:]] = torch.cat([
+                                    ckpt_base['state_dict'][key],
+                                    ckpt_base['state_dict'][key]
+                                ], dim=dim)[:control_dim_0, :control_dim_1, ...]
+                        else:
+                            ckpt_base['state_dict']['control_model.control' + key[15:]] = ckpt_base['state_dict'][key]
+            
+        res_sync = self.load_state_dict(ckpt_base['state_dict'], strict=False)
+        print(f'[{len(res_sync.missing_keys)} keys are missing from the model (hint processing and cross connections included)]')
