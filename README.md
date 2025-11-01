@@ -24,7 +24,7 @@ Download the pre-trained checkpoint from [pretrain_weight](https://drive.google.
 
 ---
 
-### Run the Test Script
+### Run the following command
 ```bash
 python inference.py \
     --ckpt_lc ./weight/lambda_1.ckpt \
