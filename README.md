@@ -5,6 +5,7 @@ This repository provides a PyTorch implementation of the paper **"One-Step Diffu
 
 ## 🧩 Introduction
 We propose **OSDiff**, a diffusion-based perceptual image compression method that performs one-step diffusion, drastically reducing inference latency and computational cost. To further boost perceptual quality, we introduce a feature-space discriminator operating on intermediate UNet representations, allowing the model to better align reconstructed features with those of the original images.
+
 ---
 
 ## 📦 Requirements
